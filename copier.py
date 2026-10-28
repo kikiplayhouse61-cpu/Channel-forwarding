@@ -1,55 +1,69 @@
+"""
+Telegram Channel Copier — Railway Deployment
+"""
 
 import os
 import json
 import asyncio
 import pickle
+import logging
+import sys
+from pathlib import Path
 
-from telethon import TelegramClient, events, Button
+from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.errors import FloodWaitError, ChannelPrivateError
+from telethon.errors import FloodWaitError, ChannelPrivateError, ChatWriteForbiddenError
 from telethon.tl.types import MessageMediaWebPage
 
-# ── RAILWAY ENVIRONMENT ──────────────────────────────────────────
 
-API_ID = int(os.environ["API_ID"])
-API_HASH = os.environ["API_HASH"]
-SESSION_STRING = os.environ["SESSION_STRING"]
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-ADMIN_USER_ID = int(os.environ["ADMIN_USER_ID"])
-
-STATE_FILE = "copy_progress.json"
-CACHE_FILE = "message_cache.pkl"
-MEDIA_DIR = "downloads"
-RETRIES = 5
-
-os.makedirs(MEDIA_DIR, exist_ok=True)
-
-# User account: existing authenticated session
-client = TelegramClient(
-    StringSession(SESSION_STRING),
-    API_ID,
-    API_HASH
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
-
-# Bot account: Telegram control panel
-bot = TelegramClient("control_bot", API_ID, API_HASH)
-
-pause_event = asyncio.Event()
-pause_event.set()
-
-stop_event = asyncio.Event()
-job_task = None
-
-channels = []
-source = None
-destinations = []
-selected_dest_ids = set()
-current_admin_chat = None
+log = logging.getLogger("copier")
 
 
-# ── STATE ────────────────────────────────────────────────────────
+def require_env(key: str) -> str:
+    val = os.environ.get(key, "").strip()
+    if not val:
+        log.critical("Missing required environment variable: %s", key)
+        sys.exit(1)
+    return val
 
-def load_state():
+
+def optional_env(key: str, default: str = "") -> str:
+    return os.environ.get(key, default).strip()
+
+
+API_ID         = int(require_env("API_ID"))
+API_HASH       = require_env("API_HASH")
+SESSION_STRING = require_env("SESSION_STRING")
+SOURCE_CHANNEL = require_env("SOURCE_CHANNEL")
+DEST_CHANNELS  = [c.strip() for c in require_env("DEST_CHANNELS").split(",") if c.strip()]
+
+DATA_DIR         = Path(optional_env("DATA_DIR", "/data"))
+DELAY_SECONDS    = float(optional_env("DELAY_SECONDS", "0.5"))
+RETRIES          = int(optional_env("RETRIES", "5"))
+BATCH_SAVE_EVERY = int(optional_env("BATCH_SAVE_EVERY", "50"))
+FLOOD_EXTRA_WAIT = int(optional_env("FLOOD_EXTRA_WAIT", "3"))
+SKIP_PROTECTED   = optional_env("SKIP_PROTECTED", "true").lower() != "false"
+MODE             = optional_env("MODE", "full").lower()
+
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+MEDIA_DIR  = DATA_DIR / "downloads"
+STATE_FILE = DATA_DIR / "copy_progress.json"
+CACHE_FILE = DATA_DIR / "message_cache.pkl"
+MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+
+log.info("DATA_DIR : %s", DATA_DIR)
+log.info("SOURCE   : %s", SOURCE_CHANNEL)
+log.info("DEST(s)  : %s", ", ".join(DEST_CHANNELS))
+log.info("MODE     : %s", MODE)
+
+
+def load_state() -> dict:
     try:
         with open(STATE_FILE, "r") as f:
             return json.load(f)
@@ -57,1171 +71,251 @@ def load_state():
         return {}
 
 
-def save_state(state):
-    tmp = STATE_FILE + ".tmp"
+def save_state(state: dict) -> None:
+    tmp = str(STATE_FILE) + ".tmp"
     with open(tmp, "w") as f:
         json.dump(state, f, indent=2)
-    os.replace(tmp, STATE_FILE)
+    Path(tmp).replace(STATE_FILE)
 
 
-def load_cache():
-    if os.path.exists(CACHE_FILE):
+def load_cache() -> dict:
+    if CACHE_FILE.exists():
         with open(CACHE_FILE, "rb") as f:
             return pickle.load(f)
     return {}
 
 
-def save_cache(cache):
-    tmp = CACHE_FILE + ".tmp"
+def save_cache(cache: dict) -> None:
+    tmp = str(CACHE_FILE) + ".tmp"
     with open(tmp, "wb") as f:
         pickle.dump(cache, f)
-    os.replace(tmp, CACHE_FILE)
+    Path(tmp).replace(CACHE_FILE)
 
 
-async def admin_message(text, buttons=None):
-    if current_admin_chat is not None:
-        await bot.send_message(
-            current_admin_chat,
-            text,
-            buttons=buttons
-        )
-
-
-# ── CHANNEL DISCOVERY ────────────────────────────────────────────
-
-async def get_channels():
-    result = []
-    async for d in client.iter_dialogs():
-        if getattr(d.entity, "broadcast", False):
-            result.append(d)
-    return result
-
-
-def get_owned_channels():
-    return [
-        d for d in channels
-        if getattr(d.entity, "creator", False)
-        or getattr(d.entity, "admin_rights", None)
-    ]
-
-
-# ── TELEGRAM BUTTON MENUS ────────────────────────────────────────
-
-async def show_sources(event):
-    global channels
-    channels = await get_channels()
-
-    if not channels:
-        await event.respond("Koi accessible broadcast channel nahi mila.")
-        return
-
-    buttons = [
-        [Button.inline(d.name[:50], f"src:{d.id}".encode())]
-        for d in channels
-    ]
-    buttons.append([Button.inline("Cancel", b"cancel")])
-
-    await event.respond(
-        "SOURCE CHANNEL select karo:",
-        buttons=buttons
-    )
-
-
-async def show_destinations(event):
-    owned = get_owned_channels()
-
-    if not owned:
-        await event.respond(
-            "Koi creator/admin broadcast channel destination ke liye nahi mila."
-        )
-        return
-
-    buttons = []
-    for d in owned:
-        mark = "✓ " if d.id in selected_dest_ids else ""
-        buttons.append([
-            Button.inline(
-                (mark + d.name)[:50],
-                f"dst:{d.id}".encode()
-            )
-        ])
-
-    buttons.append([
-        Button.inline("Confirm destinations", b"dest_confirm")
-    ])
-    buttons.append([Button.inline("Cancel", b"cancel")])
-
-    await event.respond(
-        "DESTINATION CHANNELS select karo. Multiple channels select kar sakte ho:",
-        buttons=buttons
-    )
-
-
-async def refresh_destinations(event):
-    owned = get_owned_channels()
-    buttons = []
-
-    for d in owned:
-        mark = "✓ " if d.id in selected_dest_ids else ""
-        buttons.append([
-            Button.inline(
-                (mark + d.name)[:50],
-                f"dst:{d.id}".encode()
-            )
-        ])
-
-    buttons.append([
-        Button.inline("Confirm destinations", b"dest_confirm")
-    ])
-    buttons.append([Button.inline("Cancel", b"cancel")])
-
-    await event.edit(
-        "Destination select karo (✓ = selected):",
-        buttons=buttons
-    )
-
-
-# ── PHASE 1: CACHE SOURCE MESSAGES ───────────────────────────────
-
-async def cache_messages(source_dialog, cache_key, last_cached_id):
-    cache = load_cache()
-    if cache_key not in cache:
-        cache[cache_key] = {}
-
-    msg_store = cache[cache_key]
+async def cache_messages(client, source_entity, cache_key, last_cached_id):
+    cache     = load_cache()
+    msg_store = cache.setdefault(cache_key, {})
     new_count = 0
 
-    await admin_message(
-        f"📥 Cache started\nSource: {source_dialog.name}\n"
-        f"Already cached: {len(msg_store)}"
+    log.info(
+        "[PHASE 1] Caching | already=%d | resume_after_id=%d",
+        len(msg_store), last_cached_id,
     )
 
     try:
         async for msg in client.iter_messages(
-            source_dialog.entity,
+            source_entity,
             reverse=True,
             min_id=last_cached_id,
-            wait_time=2
+            wait_time=2,
         ):
-            await pause_event.wait()
-            if stop_event.is_set():
-                break
-
             if not msg or msg.action:
                 continue
-
-            if getattr(msg, "noforwards", False):
+            if SKIP_PROTECTED and getattr(msg, "noforwards", False):
+                log.debug("SKIP protected id=%d", msg.id)
                 continue
 
             msg_store[msg.id] = msg
             new_count += 1
 
-            if new_count % 25 == 0:
+            if new_count % BATCH_SAVE_EVERY == 0:
                 save_cache(cache)
-                await admin_message(
-                    f"📥 Cached {len(msg_store)} messages..."
-                )
+                log.info("  Cached %d new (total=%d)...", new_count, len(msg_store))
 
     except ChannelPrivateError:
-        await admin_message(
-            "⚠️ Source channel access nahi hai. "
-            "Jo messages cache ho chuke hain, woh save kar diye gaye hain."
-        )
-    except Exception as e:
-        await admin_message(f"⚠️ Cache error: {type(e).__name__}: {e}")
+        log.warning("Source went private — saving what we have.")
+    except asyncio.CancelledError:
+        log.warning("Caching cancelled — progress saved.")
+    except Exception as exc:
+        log.error("Cache error: %s", exc, exc_info=True)
     finally:
         save_cache(cache)
 
+    log.info("[PHASE 1] Done | new=%d | total=%d", new_count, len(msg_store))
     return msg_store
 
 
-# ── MEDIA DOWNLOAD WITH RETRIES ─────────────────────────────────
-
-async def download_with_retry(msg):
+async def download_with_retry(client, msg):
     for attempt in range(1, RETRIES + 1):
         try:
-            path = await client.download_media(
-                msg,
-                file=MEDIA_DIR + "/"
-            )
+            path = await client.download_media(msg, file=str(MEDIA_DIR) + "/")
             if path:
                 return path
-            raise RuntimeError("No file returned")
-
-        except FloodWaitError as e:
-            await asyncio.sleep(e.seconds + 2)
-
-        except Exception as e:
-            await admin_message(
-                f"Download attempt {attempt}/{RETRIES} failed: {e}"
-            )
+            raise RuntimeError("download_media returned None")
+        except FloodWaitError as exc:
+            wait = exc.seconds + FLOOD_EXTRA_WAIT
+            log.warning("FloodWait %ds (download)...", wait)
+            await asyncio.sleep(wait)
+        except Exception as exc:
+            log.warning("Download attempt %d/%d: %s", attempt, RETRIES, exc)
             if attempt < RETRIES:
                 await asyncio.sleep(attempt * 3)
-
     return None
 
 
-# ── SEND ONE MESSAGE ─────────────────────────────────────────────
-
-async def send_one(msg, destination_list):
-    text = msg.raw_text or ""
+async def send_one(client, msg, dest_entities):
+    text  = msg.raw_text or ""
     media = msg.media
 
-    for dest in destination_list:
-        try:
-            if not media or isinstance(media, MessageMediaWebPage):
-                if text:
-                    await client.send_message(
-                        dest.entity,
-                        text,
-                        formatting_entities=msg.entities,
-                        link_preview=isinstance(media, MessageMediaWebPage)
-                    )
-            else:
-                path = await download_with_retry(msg)
-
-                if not path:
-                    return False
-
-                try:
-                    await client.send_file(
-                        dest.entity,
-                        path,
-                        caption=text or None,
-                        formatting_entities=msg.entities
-                    )
-                finally:
+    for dest in dest_entities:
+        for attempt in range(1, RETRIES + 1):
+            try:
+                if not media or isinstance(media, MessageMediaWebPage):
+                    if text:
+                        await client.send_message(
+                            dest,
+                            text,
+                            formatting_entities=msg.entities,
+                            link_preview=isinstance(media, MessageMediaWebPage),
+                        )
+                else:
+                    path = await download_with_retry(client, msg)
+                    if not path:
+                        log.error("MSG %d: download failed permanently", msg.id)
+                        return False
                     try:
-                        os.remove(path)
-                    except OSError:
-                        pass
-
-        except FloodWaitError as e:
-            await asyncio.sleep(e.seconds + 2)
-            return False
-
-        except Exception as e:
-            await admin_message(
-                f"Send error for message {msg.id}: {e}"
-            )
-            return False
-
-    return True
-
-
-# ── PHASE 2: TRANSFER FROM CACHE ─────────────────────────────────
-
-async def transfer_from_cache(msg_store, destination_list, state, state_key):
-    transferred_ids = set(state.get(state_key + "_done", []))
-    sorted_ids = sorted(msg_store.keys())
-    remaining = [i for i in sorted_ids if i not in transferred_ids]
-
-    success = 0
-    failed = 0
-
-    await admin_message(
-        f"🚀 Transfer started\nCached: {len(sorted_ids)}\n"
-        f"Remaining: {len(remaining)}"
-    )
-
-    for msg_id in remaining:
-        await pause_event.wait()
-
-        if stop_event.is_set():
-            break
-
-        msg = msg_store.get(msg_id)
-        if not msg:
-            continue
-
-        try:
-            ok = await send_one(msg, destination_list)
-        except Exception as e:
-            await admin_message(f"Transfer error {msg_id}: {e}")
-            ok = False
-
-        if ok:
-            success += 1
-            transferred_ids.add(msg_id)
-            state[state_key + "_done"] = list(transferred_ids)
-            state[state_key + "_last_sent"] = msg_id
-            save_state(state)
-        else:
-            failed += 1
-
-        if (success + failed) % 10 == 0:
-            await admin_message(
-                f"📊 Progress\nSuccess: {success}\nFailed: {failed}\n"
-                f"Remaining: {len(remaining) - success - failed}"
-            )
-
-        await asyncio.sleep(0.5)
-
-    await admin_message(
-        f"🏁 Transfer finished or stopped\n"
-        f"Success: {success}\nFailed: {failed}\n"
-        f"Progress saved."
-    )
-
-    return success, failed
-
-
-# ── FULL JOB ─────────────────────────────────────────────────────
-
-async def run_job():
-    global source, destinations
-
-    state = load_state()
-    dest_ids = ",".join(str(d.id) for d in destinations)
-    base_key = f"{source.id}:{dest_ids}"
-
-    last_cached_id = int(state.get(base_key + "_last_cached", 0))
-
-    await admin_message(
-        f"Selected source: {source.name}\n"
-        f"Destinations: {', '.join(d.name for d in destinations)}"
-    )
-
-    msg_store = await cache_messages(
-        source,
-        base_key,
-        last_cached_id
-    )
-
-    if msg_store:
-        state[base_key + "_last_cached"] = max(msg_store.keys())
-        save_state(state)
-
-    if stop_event.is_set():
-        await admin_message("⏹️ Stopped after caching. Cache saved.")
-        return
-
-    if not msg_store:
-        await admin_message("Cache empty. Transfer nahi kiya gaya.")
-        return
-
-    await transfer_from_cache(
-        msg_store,
-        destinations,
-        state,
-        base_key
-    )
-
-
-# ── BOT COMMANDS ─────────────────────────────────────────────────
-
-@bot.on(events.NewMessage(pattern=r"^/start$"))
-async def start_handler(event):
-    global current_admin_chat
-
-    if event.sender_id != ADMIN_USER_ID:
-        return
-
-    current_admin_chat = event.chat_id
-
-    await event.respond(
-        "Channel Copier Control Panel\n\n"
-        "Source aur destination select karke transfer start karo.",
-        buttons=[
-            [Button.inline("Select source channel", b"choose_source")],
-            [Button.inline("Status", b"status")],
-            [Button.inline("Pause", b"pause"),
-             Button.inline("Resume", b"resume")],
-            [Button.inline("Stop job", b"stop")]
-        ]
-    )
-
-
-@bot.on(events.NewMessage(pattern=r"^/status$"))
-async def status_handler(event):
-    if event.sender_id != ADMIN_USER_ID:
-        return
-
-    status = "RUNNING" if job_task and not job_task.done() else "IDLE"
-    pause_status = "PAUSED" if not pause_event.is_set() else "NOT PAUSED"
-
-    await event.respond(
-        f"Status: {status}\nPause: {pause_status}"
-    )
-
-
-@bot.on(events.NewMessage(pattern=r"^/pause$"))
-async def pause_handler(event):
-    if event.sender_id != ADMIN_USER_ID:
-        return
-
-    pause_event.clear()
-    await event.respond("⏸️ Pause requested.")
-
-
-@bot.on(events.NewMessage(pattern=r"^/resume$"))
-async def resume_handler(event):
-    if event.sender_id != ADMIN_USER_ID:
-        return
-
-    pause_event.set()
-    await event.respond("▶️ Resume requested.")
-
-
-@bot.on(events.NewMessage(pattern=r"^/stop$"))
-async def stop_handler(event):
-    if event.sender_id != ADMIN_USER_ID:
-        return
-
-    stop_event.set()
-    pause_event.set()
-    await event.respond("⏹️ Stop requested. Current operation may finish first.")
-
-
-@bot.on(events.CallbackQuery)
-async def callback_handler(event):
-    global source, destinations, selected_dest_ids
-    global job_task, current_admin_chat
-
-    if event.sender_id != ADMIN_USER_ID:
-        await event.answer("Unauthorized", alert=True)
-        return
-
-    current_admin_chat = event.chat_id
-    data = event.data.decode()
-
-    if data == "cancel":
-        await event.answer("Cancelled")
-        await event.edit("Cancelled.")
-        return
-
-    if data == "choose_source":
-        await event.answer()
-        await show_sources(event)
-        return
-
-    if data.startswith("src:"):
-        source_id = int(data.split(":", 1)[1])
-        source = next((d for d in channels if d.id == source_id), None)
-
-        if source is None:
-            await event.answer("Source not found. Try /start again.", alert=True)
-            return
-
-        selected_dest_ids.clear()
-        await event.answer(f"Source: {source.name}")
-        await show_destinations(event)
-        return
-
-    if data.startswith("dst:"):
-        dest_id = int(data.split(":", 1)[1])
-
-        if dest_id in selected_dest_ids:
-            selected_dest_ids.remove(dest_id)
-        else:
-            selected_dest_ids.add(dest_id)
-
-        await event.answer()
-        await refresh_destinations(event)
-        return
-
-    if data == "dest_confirm":
-        if source is None:
-            await event.answer("Select source first.", alert=True)
-            return
-
-        owned = get_owned_channels()
-        destinations = [d for d in owned if d.id in selected_dest_ids]
-
-        if not destinations:
-            await event.answer("Select at least one destination.", alert=True)
-            return
-
-        if job_task and not job_task.done():
-            await event.answer("A job is already running.", alert=True)
-            return
-
-        stop_event.clear()
-        pause_event.set()
-
-        await event.answer("Starting job")
-        await event.edit(
-            f"Ready to start\nSource: {source.name}\n"
-            f"Destinations: {', '.join(d.name for d in destinations)}",
-            buttons=[
-                [Button.inline("START FULL RUN", b"run_job")],
-                [Button.inline("Cancel", b"cancel")]
-            ]
-        )
-        return
-
-    if data == "run_job":
-        if source is None or not destinations:
-            await event.answer("Choose source and destinations first.", alert=True)
-            return
-
-        if job_task and not job_task.done():
-            await event.answer("A job is already running.", alert=True)
-            return
-
-        stop_event.clear()
-        pause_event.set()
-        job_task = asyncio.create_task(run_job())
-
-        await event.answer("Job started")
-        await event.edit("🚀 Full run started. Use /status, /pause, /resume or /stop.")
-        return
-
-    if data == "status":
-        status = "RUNNING" if job_task and not job_task.done() else "IDLE"
-        pause_status = "PAUSED" if not pause_event.is_set() else "NOT PAUSED"
-        await event.answer(f"{status} / {pause_status}", alert=True)
-        return
-
-    if data == "pause":
-        pause_event.clear()
-        await event.answer("Pause requested")
-        return
-
-    if data == "resume":
-        pause_event.set()
-        await event.answer("Resume requested")
-        return
-
-    if data == "stop":
-        stop_event.set()
-        pause_event.set()
-        await event.answer("Stop requested")
-        return
-
-
-# ── STARTUP ──────────────────────────────────────────────────────
-
-async def main():
-    await client.connect()
-
-    if not await client.is_user_authorized():
-        raise RuntimeError(
-            "SESSION_STRING is not authorized. Generate a valid user session first."
-        )
-
-    me = await client.get_me()
-    print(f"User logged in: {me.first_name} (ID: {me.id})")
-
-    await bot.start(bot_token=BOT_TOKEN)
-    print("Control bot started.")
-
-    await bot.run_until_disconnected()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
-                        
-import os
-import json
-import asyncio
-import pickle
-
-from telethon import TelegramClient, events, Button
-from telethon.sessions import StringSession
-from telethon.errors import FloodWaitError, ChannelPrivateError
-from telethon.tl.types import MessageMediaWebPage
-
-# ── RAILWAY ENVIRONMENT ──────────────────────────────────────────
-
-API_ID = int(os.environ["API_ID"])
-API_HASH = os.environ["API_HASH"]
-SESSION_STRING = os.environ["SESSION_STRING"]
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-ADMIN_USER_ID = int(os.environ["ADMIN_USER_ID"])
-
-STATE_FILE = "copy_progress.json"
-CACHE_FILE = "message_cache.pkl"
-MEDIA_DIR = "downloads"
-RETRIES = 5
-
-os.makedirs(MEDIA_DIR, exist_ok=True)
-
-# User account: existing authenticated session
-client = TelegramClient(
-    StringSession(SESSION_STRING),
-    API_ID,
-    API_HASH
-)
-
-# Bot account: Telegram control panel
-bot = TelegramClient("control_bot", API_ID, API_HASH)
-
-pause_event = asyncio.Event()
-pause_event.set()
-
-stop_event = asyncio.Event()
-job_task = None
-
-channels = []
-source = None
-destinations = []
-selected_dest_ids = set()
-current_admin_chat = None
-
-
-# ── STATE ────────────────────────────────────────────────────────
-
-def load_state():
-    try:
-        with open(STATE_FILE, "r") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-
-
-def save_state(state):
-    tmp = STATE_FILE + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(state, f, indent=2)
-    os.replace(tmp, STATE_FILE)
-
-
-def load_cache():
-    if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, "rb") as f:
-            return pickle.load(f)
-    return {}
-
-
-def save_cache(cache):
-    tmp = CACHE_FILE + ".tmp"
-    with open(tmp, "wb") as f:
-        pickle.dump(cache, f)
-    os.replace(tmp, CACHE_FILE)
-
-
-async def admin_message(text, buttons=None):
-    if current_admin_chat is not None:
-        await bot.send_message(
-            current_admin_chat,
-            text,
-            buttons=buttons
-        )
-
-
-# ── CHANNEL DISCOVERY ────────────────────────────────────────────
-
-async def get_channels():
-    result = []
-    async for d in client.iter_dialogs():
-        if getattr(d.entity, "broadcast", False):
-            result.append(d)
-    return result
-
-
-def get_owned_channels():
-    return [
-        d for d in channels
-        if getattr(d.entity, "creator", False)
-        or getattr(d.entity, "admin_rights", None)
-    ]
-
-
-# ── TELEGRAM BUTTON MENUS ────────────────────────────────────────
-
-async def show_sources(event):
-    global channels
-    channels = await get_channels()
-
-    if not channels:
-        await event.respond("Koi accessible broadcast channel nahi mila.")
-        return
-
-    buttons = [
-        [Button.inline(d.name[:50], f"src:{d.id}".encode())]
-        for d in channels
-    ]
-    buttons.append([Button.inline("Cancel", b"cancel")])
-
-    await event.respond(
-        "SOURCE CHANNEL select karo:",
-        buttons=buttons
-    )
-
-
-async def show_destinations(event):
-    owned = get_owned_channels()
-
-    if not owned:
-        await event.respond(
-            "Koi creator/admin broadcast channel destination ke liye nahi mila."
-        )
-        return
-
-    buttons = []
-    for d in owned:
-        mark = "✓ " if d.id in selected_dest_ids else ""
-        buttons.append([
-            Button.inline(
-                (mark + d.name)[:50],
-                f"dst:{d.id}".encode()
-            )
-        ])
-
-    buttons.append([
-        Button.inline("Confirm destinations", b"dest_confirm")
-    ])
-    buttons.append([Button.inline("Cancel", b"cancel")])
-
-    await event.respond(
-        "DESTINATION CHANNELS select karo. Multiple channels select kar sakte ho:",
-        buttons=buttons
-    )
-
-
-async def refresh_destinations(event):
-    owned = get_owned_channels()
-    buttons = []
-
-    for d in owned:
-        mark = "✓ " if d.id in selected_dest_ids else ""
-        buttons.append([
-            Button.inline(
-                (mark + d.name)[:50],
-                f"dst:{d.id}".encode()
-            )
-        ])
-
-    buttons.append([
-        Button.inline("Confirm destinations", b"dest_confirm")
-    ])
-    buttons.append([Button.inline("Cancel", b"cancel")])
-
-    await event.edit(
-        "Destination select karo (✓ = selected):",
-        buttons=buttons
-    )
-
-
-# ── PHASE 1: CACHE SOURCE MESSAGES ───────────────────────────────
-
-async def cache_messages(source_dialog, cache_key, last_cached_id):
-    cache = load_cache()
-    if cache_key not in cache:
-        cache[cache_key] = {}
-
-    msg_store = cache[cache_key]
-    new_count = 0
-
-    await admin_message(
-        f"📥 Cache started\nSource: {source_dialog.name}\n"
-        f"Already cached: {len(msg_store)}"
-    )
-
-    try:
-        async for msg in client.iter_messages(
-            source_dialog.entity,
-            reverse=True,
-            min_id=last_cached_id,
-            wait_time=2
-        ):
-            await pause_event.wait()
-            if stop_event.is_set():
+                        await client.send_file(
+                            dest,
+                            path,
+                            caption=text or None,
+                            formatting_entities=msg.entities,
+                        )
+                    finally:
+                        try:
+                            Path(path).unlink(missing_ok=True)
+                        except OSError:
+                            pass
                 break
 
-            if not msg or msg.action:
-                continue
+            except FloodWaitError as exc:
+                wait = exc.seconds + FLOOD_EXTRA_WAIT
+                log.warning("FloodWait %ds (send)...", wait)
+                await asyncio.sleep(wait)
 
-            if getattr(msg, "noforwards", False):
-                continue
+            except ChatWriteForbiddenError:
+                log.error("MSG %d: no write permission in dest", msg.id)
+                return False
 
-            msg_store[msg.id] = msg
-            new_count += 1
-
-            if new_count % 25 == 0:
-                save_cache(cache)
-                await admin_message(
-                    f"📥 Cached {len(msg_store)} messages..."
-                )
-
-    except ChannelPrivateError:
-        await admin_message(
-            "⚠️ Source channel access nahi hai. "
-            "Jo messages cache ho chuke hain, woh save kar diye gaye hain."
-        )
-    except Exception as e:
-        await admin_message(f"⚠️ Cache error: {type(e).__name__}: {e}")
-    finally:
-        save_cache(cache)
-
-    return msg_store
-
-
-# ── MEDIA DOWNLOAD WITH RETRIES ─────────────────────────────────
-
-async def download_with_retry(msg):
-    for attempt in range(1, RETRIES + 1):
-        try:
-            path = await client.download_media(
-                msg,
-                file=MEDIA_DIR + "/"
-            )
-            if path:
-                return path
-            raise RuntimeError("No file returned")
-
-        except FloodWaitError as e:
-            await asyncio.sleep(e.seconds + 2)
-
-        except Exception as e:
-            await admin_message(
-                f"Download attempt {attempt}/{RETRIES} failed: {e}"
-            )
-            if attempt < RETRIES:
-                await asyncio.sleep(attempt * 3)
-
-    return None
-
-
-# ── SEND ONE MESSAGE ─────────────────────────────────────────────
-
-async def send_one(msg, destination_list):
-    text = msg.raw_text or ""
-    media = msg.media
-
-    for dest in destination_list:
-        try:
-            if not media or isinstance(media, MessageMediaWebPage):
-                if text:
-                    await client.send_message(
-                        dest.entity,
-                        text,
-                        formatting_entities=msg.entities,
-                        link_preview=isinstance(media, MessageMediaWebPage)
-                    )
-            else:
-                path = await download_with_retry(msg)
-
-                if not path:
+            except Exception as exc:
+                log.warning("Send attempt %d/%d msg %d: %s", attempt, RETRIES, msg.id, exc)
+                if attempt < RETRIES:
+                    await asyncio.sleep(attempt * 2)
+                else:
+                    log.error("MSG %d: send failed permanently.", msg.id)
                     return False
-
-                try:
-                    await client.send_file(
-                        dest.entity,
-                        path,
-                        caption=text or None,
-                        formatting_entities=msg.entities
-                    )
-                finally:
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
-
-        except FloodWaitError as e:
-            await asyncio.sleep(e.seconds + 2)
-            return False
-
-        except Exception as e:
-            await admin_message(
-                f"Send error for message {msg.id}: {e}"
-            )
-            return False
 
     return True
 
 
-# ── PHASE 2: TRANSFER FROM CACHE ─────────────────────────────────
-
-async def transfer_from_cache(msg_store, destination_list, state, state_key):
+async def transfer_from_cache(client, msg_store, dest_entities, state, state_key):
     transferred_ids = set(state.get(state_key + "_done", []))
-    sorted_ids = sorted(msg_store.keys())
-    remaining = [i for i in sorted_ids if i not in transferred_ids]
+    sorted_ids      = sorted(msg_store.keys())
+    remaining       = [i for i in sorted_ids if i not in transferred_ids]
 
-    success = 0
-    failed = 0
-
-    await admin_message(
-        f"🚀 Transfer started\nCached: {len(sorted_ids)}\n"
-        f"Remaining: {len(remaining)}"
+    log.info(
+        "[PHASE 2] Transfer | total=%d | done=%d | remaining=%d",
+        len(sorted_ids), len(transferred_ids), len(remaining),
     )
 
+    success = 0
+    failed  = 0
+
     for msg_id in remaining:
-        await pause_event.wait()
-
-        if stop_event.is_set():
-            break
-
         msg = msg_store.get(msg_id)
         if not msg:
             continue
 
         try:
-            ok = await send_one(msg, destination_list)
-        except Exception as e:
-            await admin_message(f"Transfer error {msg_id}: {e}")
+            ok = await send_one(client, msg, dest_entities)
+        except Exception as exc:
+            log.error("MSG %d: unexpected error: %s", msg_id, exc, exc_info=True)
             ok = False
 
         if ok:
             success += 1
             transferred_ids.add(msg_id)
-            state[state_key + "_done"] = list(transferred_ids)
+            state[state_key + "_done"]      = list(transferred_ids)
             state[state_key + "_last_sent"] = msg_id
             save_state(state)
+            log.info(
+                "  OK id=%-8d | sent=%-5d | failed=%-4d | remain=%d",
+                msg_id, success, failed,
+                len(remaining) - success - failed,
+            )
         else:
             failed += 1
+            log.warning("  FAIL id=%-8d | sent=%-5d | failed=%-4d", msg_id, success, failed)
 
-        if (success + failed) % 10 == 0:
-            await admin_message(
-                f"📊 Progress\nSuccess: {success}\nFailed: {failed}\n"
-                f"Remaining: {len(remaining) - success - failed}"
-            )
+        await asyncio.sleep(DELAY_SECONDS)
 
-        await asyncio.sleep(0.5)
-
-    await admin_message(
-        f"🏁 Transfer finished or stopped\n"
-        f"Success: {success}\nFailed: {failed}\n"
-        f"Progress saved."
-    )
-
+    log.info("[PHASE 2] Done | success=%d | failed=%d", success, failed)
     return success, failed
 
 
-# ── FULL JOB ─────────────────────────────────────────────────────
+async def main():
+    log.info("Starting Telegram Copier...")
 
-async def run_job():
-    global source, destinations
+    client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+    await client.start()
 
-    state = load_state()
-    dest_ids = ",".join(str(d.id) for d in destinations)
-    base_key = f"{source.id}:{dest_ids}"
+    me = await client.get_me()
+    log.info("Logged in as: %s (id=%d)", me.first_name, me.id)
+
+    try:
+        source_entity = await client.get_entity(
+            int(SOURCE_CHANNEL) if SOURCE_CHANNEL.lstrip("-").isdigit() else SOURCE_CHANNEL
+        )
+        log.info("Source: %s (id=%d)", getattr(source_entity, "title", SOURCE_CHANNEL), source_entity.id)
+    except Exception as exc:
+        log.critical("Cannot resolve SOURCE_CHANNEL '%s': %s", SOURCE_CHANNEL, exc)
+        await client.disconnect()
+        sys.exit(1)
+
+    dest_entities = []
+    for dest_str in DEST_CHANNELS:
+        try:
+            ent = await client.get_entity(
+                int(dest_str) if dest_str.lstrip("-").isdigit() else dest_str
+            )
+            dest_entities.append(ent)
+            log.info("Dest: %s (id=%d)", getattr(ent, "title", dest_str), ent.id)
+        except Exception as exc:
+            log.error("Cannot resolve dest '%s': %s — skipping.", dest_str, exc)
+
+    if not dest_entities:
+        log.critical("No valid destinations. Exiting.")
+        await client.disconnect()
+        sys.exit(1)
+
+    dest_ids = ",".join(str(e.id) for e in dest_entities)
+    base_key = f"{source_entity.id}:{dest_ids}"
+    state    = load_state()
 
     last_cached_id = int(state.get(base_key + "_last_cached", 0))
 
-    await admin_message(
-        f"Selected source: {source.name}\n"
-        f"Destinations: {', '.join(d.name for d in destinations)}"
-    )
-
-    msg_store = await cache_messages(
-        source,
-        base_key,
-        last_cached_id
-    )
-
-    if msg_store:
-        state[base_key + "_last_cached"] = max(msg_store.keys())
-        save_state(state)
-
-    if stop_event.is_set():
-        await admin_message("⏹️ Stopped after caching. Cache saved.")
-        return
-
-    if not msg_store:
-        await admin_message("Cache empty. Transfer nahi kiya gaya.")
-        return
-
-    await transfer_from_cache(
-        msg_store,
-        destinations,
-        state,
-        base_key
-    )
-
-
-# ── BOT COMMANDS ─────────────────────────────────────────────────
-
-@bot.on(events.NewMessage(pattern=r"^/start$"))
-async def start_handler(event):
-    global current_admin_chat
-
-    if event.sender_id != ADMIN_USER_ID:
-        return
-
-    current_admin_chat = event.chat_id
-
-    await event.respond(
-        "Channel Copier Control Panel\n\n"
-        "Source aur destination select karke transfer start karo.",
-        buttons=[
-            [Button.inline("Select source channel", b"choose_source")],
-            [Button.inline("Status", b"status")],
-            [Button.inline("Pause", b"pause"),
-             Button.inline("Resume", b"resume")],
-            [Button.inline("Stop job", b"stop")]
-        ]
-    )
-
-
-@bot.on(events.NewMessage(pattern=r"^/status$"))
-async def status_handler(event):
-    if event.sender_id != ADMIN_USER_ID:
-        return
-
-    status = "RUNNING" if job_task and not job_task.done() else "IDLE"
-    pause_status = "PAUSED" if not pause_event.is_set() else "NOT PAUSED"
-
-    await event.respond(
-        f"Status: {status}\nPause: {pause_status}"
-    )
-
-
-@bot.on(events.NewMessage(pattern=r"^/pause$"))
-async def pause_handler(event):
-    if event.sender_id != ADMIN_USER_ID:
-        return
-
-    pause_event.clear()
-    await event.respond("⏸️ Pause requested.")
-
-
-@bot.on(events.NewMessage(pattern=r"^/resume$"))
-async def resume_handler(event):
-    if event.sender_id != ADMIN_USER_ID:
-        return
-
-    pause_event.set()
-    await event.respond("▶️ Resume requested.")
-
-
-@bot.on(events.NewMessage(pattern=r"^/stop$"))
-async def stop_handler(event):
-    if event.sender_id != ADMIN_USER_ID:
-        return
-
-    stop_event.set()
-    pause_event.set()
-    await event.respond("⏹️ Stop requested. Current operation may finish first.")
-
-
-@bot.on(events.CallbackQuery)
-async def callback_handler(event):
-    global source, destinations, selected_dest_ids
-    global job_task, current_admin_chat
-
-    if event.sender_id != ADMIN_USER_ID:
-        await event.answer("Unauthorized", alert=True)
-        return
-
-    current_admin_chat = event.chat_id
-    data = event.data.decode()
-
-    if data == "cancel":
-        await event.answer("Cancelled")
-        await event.edit("Cancelled.")
-        return
-
-    if data == "choose_source":
-        await event.answer()
-        await show_sources(event)
-        return
-
-    if data.startswith("src:"):
-        source_id = int(data.split(":", 1)[1])
-        source = next((d for d in channels if d.id == source_id), None)
-
-        if source is None:
-            await event.answer("Source not found. Try /start again.", alert=True)
+    if MODE in ("full", "cache_only"):
+        msg_store = await cache_messages(client, source_entity, base_key, last_cached_id)
+        if msg_store:
+            state[base_key + "_last_cached"] = max(msg_store.keys())
+            save_state(state)
+        if MODE == "cache_only":
+            log.info("MODE=cache_only done.")
+            await client.disconnect()
             return
 
-        selected_dest_ids.clear()
-        await event.answer(f"Source: {source.name}")
-        await show_destinations(event)
-        return
+    if MODE in ("full", "transfer_only"):
+        cache     = load_cache()
+        msg_store = cache.get(base_key, {})
+        if not msg_store:
+            log.critical("Cache empty. Run MODE=cache_only first.")
+            await client.disconnect()
+            sys.exit(1)
 
-    if data.startswith("dst:"):
-        dest_id = int(data.split(":", 1)[1])
+        await transfer_from_cache(client, msg_store, dest_entities, state, base_key)
 
-        if dest_id in selected_dest_ids:
-            selected_dest_ids.remove(dest_id)
-        else:
-            selected_dest_ids.add(dest_id)
-
-        await event.answer()
-        await refresh_destinations(event)
-        return
-
-    if data == "dest_confirm":
-        if source is None:
-            await event.answer("Select source first.", alert=True)
-            return
-
-        owned = get_owned_channels()
-        destinations = [d for d in owned if d.id in selected_dest_ids]
-
-        if not destinations:
-            await event.answer("Select at least one destination.", alert=True)
-            return
-
-        if job_task and not job_task.done():
-            await event.answer("A job is already running.", alert=True)
-            return
-
-        stop_event.clear()
-        pause_event.set()
-
-        await event.answer("Starting job")
-        await event.edit(
-            f"Ready to start\nSource: {source.name}\n"
-            f"Destinations: {', '.join(d.name for d in destinations)}",
-            buttons=[
-                [Button.inline("START FULL RUN", b"run_job")],
-                [Button.inline("Cancel", b"cancel")]
-            ]
-        )
-        return
-
-    if data == "run_job":
-        if source is None or not destinations:
-            await event.answer("Choose source and destinations first.", alert=True)
-            return
-
-        if job_task and not job_task.done():
-            await event.answer("A job is already running.", alert=True)
-            return
-
-        stop_event.clear()
-        pause_event.set()
-        job_task = asyncio.create_task(run_job())
-
-        await event.answer("Job started")
-        await event.edit("🚀 Full run started. Use /status, /pause, /resume or /stop.")
-        return
-
-    if data == "status":
-        status = "RUNNING" if job_task and not job_task.done() else "IDLE"
-        pause_status = "PAUSED" if not pause_event.is_set() else "NOT PAUSED"
-        await event.answer(f"{status} / {pause_status}", alert=True)
-        return
-
-    if data == "pause":
-        pause_event.clear()
-        await event.answer("Pause requested")
-        return
-
-    if data == "resume":
-        pause_event.set()
-        await event.answer("Resume requested")
-        return
-
-    if data == "stop":
-        stop_event.set()
-        pause_event.set()
-        await event.answer("Stop requested")
-        return
-
-
-# ── STARTUP ──────────────────────────────────────────────────────
-
-async def main():
-    await client.connect()
-
-    if not await client.is_user_authorized():
-        raise RuntimeError(
-            "SESSION_STRING is not authorized. Generate a valid user session first."
-        )
-
-    me = await client.get_me()
-    print(f"User logged in: {me.first_name} (ID: {me.id})")
-
-    await bot.start(bot_token=BOT_TOKEN)
-    print("Control bot started.")
-
-    await bot.run_until_disconnected()
+    await client.disconnect()
+    log.info("Done. Exiting cleanly.")
 
 
 if __name__ == "__main__":
     asyncio.run(main())
-        
